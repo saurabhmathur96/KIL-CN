@@ -1,5 +1,5 @@
 # import pyximport; pyximport.install(language_level = 3)
-from leaf import fit_base, Dataset, fit_base, fit_grad
+from leaf2 import fit_base, Dataset, fit_base, fit_grad
 import pandas as pd
 import numpy as np
 
