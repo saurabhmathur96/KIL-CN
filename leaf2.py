@@ -2,7 +2,7 @@ from itertools import islice
 from itertools import product
 
 import numpy as np
-from scipy.optimize import minimize
+from scipy.optimize import minimize, check_grad
 from scipy.sparse.csgraph import depth_first_order
 from scipy.sparse.csgraph import minimum_spanning_tree
 from scipy.special import softmax, log_softmax, logsumexp
@@ -36,10 +36,12 @@ class ChowLiuTree:
     self.parent = parent
     self.r = r
     self.log_factors = log_factors
+    self.params_size = sum(e.size for e in log_factors)
     ranges = [np.arange(ri) for ri in r]
     self.values = np.array(np.meshgrid(*ranges)).T.reshape(-1, self.n)
 
   def logpc(self, i: int, V: np.ndarray):
+
     # P(xi = vi | Pa(xi) = vj); Pa(xi) = xj
     if self.parent[i] < 0:
       return self.log_factors[i][V[:, i]]
@@ -198,9 +200,6 @@ def pack(x: list, parent: list, r: list):
   return np.array(packed)
 
 
-
-
-
 def unpack(x: np.ndarray, parent: list, r: list):
   x_iter = iter(x)
   return [
@@ -299,9 +298,10 @@ def f(x: np.ndarray, parent: list, r: list, X: np.ndarray, ss: list, alpha: floa
 
   reg = sum([np.sum(e) for e in log_factors])
   tree = ChowLiuTree(parent, r, log_factors)
+  denom = len(X) + alpha * len(x) + lambda_ * np.count_nonzero(C)
   if len(X) == 0:
-    return -alpha * reg + lambda_ * tree.penalty(C, epsilon)
-  return -tree.loglik(X) / len(X) - alpha * reg / len(X) + lambda_ * tree.penalty(C, epsilon)
+    return (-alpha * reg + lambda_ * tree.penalty(C, epsilon)) / denom
+  return (-tree.loglik(X) - alpha * reg + lambda_ * tree.penalty(C, epsilon)) / denom
 
 
 def g(x: np.ndarray, parent: list, r: list, X: np.ndarray, ss: list, alpha: float, C: np.ndarray, epsilon: float,
@@ -316,31 +316,39 @@ def g(x: np.ndarray, parent: list, r: list, X: np.ndarray, ss: list, alpha: floa
   ]
 
   reg_grad = [
-    np.sum(factor_grads[i] / np.exp(log_factors[i]), axis=1)
+    np.sum(factor_grads[i] * np.exp(-log_factors[i]), axis=1)
     if pi < 0
-    else [np.sum(factor_grads[i][j] / np.exp(log_factors[i][j]), axis=1) for j in range(r[pi])]
+    else [np.sum(factor_grads[i][j] * np.exp(-log_factors[i][j]), axis=1) for j in range(r[pi])]
     for i, pi in enumerate(parent)
   ]
   tree = ChowLiuTree(parent, r, log_factors)
   p_terms = penalty_grad(tree, factor_grads, C, epsilon)
+  denom = len(X) + alpha * len(x) + lambda_ * np.count_nonzero(C)
   if len(X) == 0:
-    return -alpha * pack(reg_grad, parent, r) + lambda_ * pack(p_terms, parent, r)
+    return (-alpha * pack(reg_grad, parent, r) + lambda_ * pack(p_terms, parent, r)) / denom
 
   ll_terms = loglik_grad(tree, ss)
-  return -pack(ll_terms, parent, r) / len(X) - alpha * pack(reg_grad, parent, r) / len(X) + lambda_ * pack(p_terms,
-                                                                                                           parent, r)
+  return (-pack(ll_terms, parent, r) - alpha * pack(reg_grad, parent, r) + lambda_ * pack(p_terms, parent, r)) / denom
 
 
-def fit_grad(D: Dataset, C: np.ndarray, epsilon: float, lambda_: float, alpha: float, parent: list = None):
-  if parent is None:
-    parent = fit_structure(D, alpha)
+def fit_grad(D: Dataset, C: np.ndarray, epsilon: float, lambda_: float, alpha: float):
+  parent = fit_structure(D, alpha)
   ss = sufficient_stats(parent, D)
   log_factors = fit_base_parameters(parent, D, alpha)
+  base = ChowLiuTree(parent, D.r, log_factors)
+
   if lambda_ == 0:
-    return ChowLiuTree(parent, D.r, log_factors)
+    return base
+  if np.isclose(base.penalty(C, epsilon), 0):
+    # print (np.isclose(base.penalty(C, epsilon), 0))
+    return base
+
   init = pack(log_factors, parent, D.r)
   args = (parent, D.r, D.X, ss, alpha, C, epsilon, lambda_)
-  res = minimize(f, init, jac=g, args=args, method="L-BFGS-B")
+  # print (check_grad(f, g, init, *args))
+  # print (g(init, *args))
+  options = dict(maxfun=30000, maxiter=30000)
+  res = minimize(f, init, jac=g, args=args, method="L-BFGS-B", options=options)
 
   theta = unpack(res.x, parent, D.r)
   log_factors = [log_softmax(t) if p < 0 else log_softmax(t, axis=1)
