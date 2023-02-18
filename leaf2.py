@@ -1,12 +1,18 @@
+from typing import *
+import numpy.typing as npt
+
 from itertools import islice
 from itertools import product
+from itertools import combinations_with_replacement
 
 import numpy as np
 from scipy.optimize import minimize, check_grad
 from scipy.sparse.csgraph import depth_first_order
 from scipy.sparse.csgraph import minimum_spanning_tree
 from scipy.special import softmax, log_softmax, logsumexp
+from scipy.special import xlogy
 
+seeds = [29128, 70796, 35117, 72774, 59670, 18922, 28321, 59607, 38085, 34675]
 
 def s_grad(x: np.ndarray):
   sx = softmax(x)
@@ -18,11 +24,114 @@ def s_grad(x: np.ndarray):
 class Dataset:
   X: np.ndarray
   r: list
-
-  def __init__(self, X, r):
+  scope: list
+  
+  def __init__(self, X: np.ndarray, r: list, scope = None):
     self.X = X
     self.r = r
+    if scope is None:
+      self.scope = list(range(len(r))) # scope
+    else:
+      self.scope = list(scope)
+    
+  def split(self, v):
+    remaining = [ri for ri, vi in zip(self.r, self.scope) if vi != v]
+    scope = [vi for vi in self.scope if vi != v]
+    index = [i for i, vi in enumerate(self.scope) if vi != v]
+    Xv = self.X[:, self.scope.index(v)]
+    return [
+        (x, Dataset(
+          self.X[Xv == x][:, index], 
+          remaining, 
+          scope
+        ))
+        for x in range(self.r[self.scope.index(v)])
+    ]
+  
 
+
+class DatasetWithKnowledge(Dataset):
+  X: np.ndarray
+  r: list
+  scope: list
+  C: np.ndarray
+  epsilon: float
+  
+  def __init__(self, X: np.ndarray, r: list, C: np.ndarray, epsilon: float, scope = None):
+    super().__init__(X, r, scope)
+    self.C = C.astype(int)
+    self.epsilon = epsilon
+  
+  def add_noise(self, noise: float = 0.3):
+    # Add noise
+    # for every X inf+ Y, replace noise % of Y with r[Y] - ceil(X*r[Y]/r[X])
+    gen = np.random.default_rng(seed = seeds[0])
+    X = np.array(self.X)
+    noise_size = int(len(X) * noise)
+    for i, j in zip(*np.nonzero(self.C)):
+      ratio = (self.r[i] - 1)/(self.r[j] - 1)
+      if self.C[i, j] == +1:
+        gen.shuffle(X)
+        X[:noise_size, i] = self.r[i] - 1 - np.floor(self.X[:noise_size, j]*ratio )
+      else:
+        gen.shuffle(X)
+        X[:noise_size, i] = np.floor(self.X[:noise_size, j]*ratio)
+    gen.shuffle(X)
+    return DatasetWithKnowledge(
+          X, 
+          self.r,
+          self.C,
+          self.epsilon,
+          self.scope
+    )
+  
+  def split(self, v):
+    remaining = [ri for ri, vi in zip(self.r, self.scope) if vi != v]
+    scope = [vi for vi in self.scope if vi != v]
+    index = [i for i, vi in enumerate(self.scope) if vi != v]
+    Xv = self.X[:, self.scope.index(v)]
+
+    return [
+        (x, DatasetWithKnowledge(
+          self.X[Xv == x][:, index], 
+          remaining,
+          self.C[index, :][:, index],
+          self.epsilon,
+          scope
+        ))
+        for x in range(self.r[self.scope.index(v)])
+    ]
+  
+  def subset(self, variables):
+    remaining = [self.r[self.scope.index(vi)] for vi in variables]
+    scope = variables
+    index = [self.scope.index(vi) for vi in variables]
+    
+    return DatasetWithKnowledge(
+          self.X[:, index], 
+          remaining,
+          self.C[index, :][:, index],
+          self.epsilon,
+          scope
+    )
+  
+  def bootstrap_samples(self, k: int = 5):
+    samples = []
+    for seed in seeds[:k]:
+      gen = np.random.default_rng(seed = seed)
+      N = len(self.X)
+      i = gen.choice(np.arange(N), replace=True, size=N)
+      X = np.array(self.X[i])
+      
+      samples.append(DatasetWithKnowledge(
+            X, 
+            self.r,
+            self.C,
+            self.epsilon,
+            self.scope
+      ))
+    return samples
+  
 
 class ChowLiuTree:
   n: int
@@ -197,7 +306,7 @@ def pack(x: list, parent: list, r: list):
     else:
       for vp in range(r[p]):
         packed.extend(x[i][vp])
-  return np.array(packed)
+  return np.array(packed, dtype = float)
 
 
 def unpack(x: np.ndarray, parent: list, r: list):
@@ -249,20 +358,130 @@ def pc(i: int, j: int, X: np.ndarray, r: list, alpha: float):
   return (cij / np.sum(cij, axis=0)).T
 
 
+def compute_mutual_information(D: Dataset, alpha: float):
+  X = D.X
+  r = D.r
+  n: int = len(D.scope)
+  MI: np.ndarray = np.zeros((n, n))
+  for i, j in combinations_with_replacement(range(n), r=2):
+    if i == j:
+      _p = p1(i, X, r, alpha)
+      MI[i, i] = -np.sum(xlogy(_p, _p))
+    else:
+      _p2 = p2(i, j, X, r, alpha)
+      _pi1 = _p2.sum(axis = 1)
+      _pj1 = _p2.sum(axis = 0)
+      MI[i, j] = MI[j, i] = sum([
+        _p2[vi, vj] * (np.log(_p2[vi, vj]) - np.log(_pi1[vi]) - np.log(_pj1[vj]))
+        for vi, vj in product(range(r[i]), range(r[j]))
+      ]) 
+  return np.clip(MI, 1e-20, None)
+  
+def compute_mutual_information_with_knowledge2(D: DatasetWithKnowledge, alpha: float, tries: int = 10):
+  X = D.X
+  r = D.r
+  n: int = len(D.scope)
+  MI: np.ndarray = np.zeros((n, n))
+  for i, j in combinations_with_replacement(range(n), r=2):
+    if i == j:
+      _p = p1(i, X, r, alpha)
+      MI[i, i] = -np.sum(xlogy(_p, _p))
+      continue
+      
+    if not np.all(D.C[(i,j), :][:, (i,j)] == 0):
+      
+      D_ = D.subset([D.scope[i], D.scope[j]])
+      assert np.all(D.C[(i,j), :][:, (i,j)] == D_.C)
+      parent = [-1, 0]
+      log_factors = fit_base_parameters(parent, D_, alpha)
+      clt = ChowLiuTree(parent, D_.r, log_factors)
+      prev = clt.penalty(D_.C, D_.epsilon)
+
+      for L in range(tries):
+        if np.isclose(prev, 0):
+          break
+
+        # parent: list, D: Dataset, alpha: float, lambda_: float
+        clt.log_factors = fit_grad_parameters(parent, D_, alpha, (10 ** L))
+
+        current = clt.penalty(D_.C, D_.epsilon)
+        if not (current < prev):
+          break
+        prev = current
+      
+      _p2 = np.zeros((r[i], r[j]))
+      for v in np.ndindex(r[i], r[j]):
+        _p2[v] = np.exp(clt.logp(np.array(v)[None, :]))[0]
+    else:
+      _p2 = p2(i, j, X, r, alpha)
+    _pi1 = _p2.sum(axis = 1)
+    _pj1 = _p2.sum(axis = 0)
+    MI[i, j] = MI[j, i] = sum([
+      _p2[vi, vj] * (np.log(_p2[vi, vj]) - np.log(_pi1[vi]) - np.log(_pj1[vj]))
+      for vi, vj in product(range(r[i]), range(r[j]))
+    ]) 
+  return np.clip(MI, 1e-20, None)
+
+def compute_mutual_information_with_knowledge(D: DatasetWithKnowledge, alpha: float, tries: int = 10):
+  # fit chow-liu tree
+  parent = fit_structure(D, alpha)
+  log_factors = fit_base_parameters(parent, D, alpha)
+  clt = ChowLiuTree(parent, D.r, log_factors)
+  prev = clt.penalty(D.C, D.epsilon)
+
+  for L in range(tries):
+    if np.isclose(prev, 0):
+      break
+    
+    clt.log_factors = fit_grad_parameters(parent, D, alpha, (10 ** L))
+
+    current = clt.penalty(D.C, D.epsilon)
+    if not (current < prev):
+      break
+    prev = current
+  
+  # estimate MI from tree
+  n = len(D.scope)
+  C = D.C
+  r = D.r
+  MI = np.zeros((n, n))
+  for i, j in combinations_with_replacement(range(n), r=2):
+    if i == j:
+      _p = np.zeros(r[i])
+      for v in range(r[i]):
+        _p[v] = np.exp(clt.logmar([(i, v)]))
+      MI[i, i] = -np.sum(xlogy(_p, _p))
+    else:    
+      _p2 = np.zeros((r[i], r[j]))
+      for vi, vj in np.ndindex(r[i], r[j]):
+        _p2[vi, vj] = np.exp(clt.logmar([(i, vi), (j, vj)]))
+      
+      
+      _pi1 = _p2.sum(axis = 1)
+      _pj1 = _p2.sum(axis = 0)
+      
+      MI[i, j] = MI[j, i] = sum([
+        _p2[vi, vj] * (np.log(_p2[vi, vj]) - np.log(_pi1[vi]) - np.log(_pj1[vj]))
+        for vi, vj in np.ndindex(r[i], r[j])
+      ]) 
+  return np.clip(MI, 1e-20, None)
+
 def fit_structure(D: Dataset, alpha: float):
   X = D.X
   r = D.r
   n: int = X.shape[1]
-  MI: np.ndarray = np.zeros((n, n))
-  for i, j in product(range(n), range(n)):
-    _p2: np.ndarray = p2(i, j, X, r, alpha)
-    _pi1: np.ndarray = p1(i, X, r, alpha)
-    _pj1: np.ndarray = p1(j, X, r, alpha)
-    MI[i, j] = MI[j, i] = sum([
-      _p2[vi, vj] * (np.log(_p2[vi, vj]) - np.log(_pi1[vi]) - np.log(_pj1[vj]))
-      for vi, vj in product(range(r[i]), range(r[j]))
-    ])
-  MI[np.isclose(MI, 0)] = -1e-6
+  MI: np.ndarray = compute_mutual_information(D, alpha)
+  mst = minimum_spanning_tree(-MI)
+  dfs_tree = depth_first_order(mst, directed=False, i_start=0)
+  parent = [-1 for _ in range(n)]
+  for p in range(1, n):
+    parent[p] = dfs_tree[1][p]
+
+  return parent
+
+def fit_structure_with_knowledge(D: DatasetWithKnowledge, alpha: float):
+  n: int = D.X.shape[1]
+  MI: np.ndarray = compute_mutual_information_with_knowledge(D, alpha)
   mst = minimum_spanning_tree(-MI)
   dfs_tree = depth_first_order(mst, directed=False, i_start=0)
   parent = [-1 for _ in range(n)]
@@ -282,12 +501,6 @@ def fit_base_parameters(parent: list, D: Dataset, alpha: float):
     else np.log(pc(i, parent[i], X, r, alpha))
     for i in range(n)
   ]
-
-
-def fit_base(D: Dataset, alpha: float):
-  parent = fit_structure(D, alpha)
-  log_factors = fit_base_parameters(parent, D, alpha)
-  return ChowLiuTree(parent, D.r, log_factors)
 
 
 def f(x: np.ndarray, parent: list, r: list, X: np.ndarray, ss: list, alpha: float, C: np.ndarray, epsilon: float,
@@ -330,21 +543,22 @@ def g(x: np.ndarray, parent: list, r: list, X: np.ndarray, ss: list, alpha: floa
   ll_terms = loglik_grad(tree, ss)
   return (-pack(ll_terms, parent, r) - alpha * pack(reg_grad, parent, r) + lambda_ * pack(p_terms, parent, r)) / denom
 
-
-def fit_grad(D: Dataset, C: np.ndarray, epsilon: float, lambda_: float, alpha: float):
-  parent = fit_structure(D, alpha)
+def fit_grad_parameters(parent: list, D: DatasetWithKnowledge, alpha: float, lambda_: float, init_log_factors = None):
   ss = sufficient_stats(parent, D)
-  log_factors = fit_base_parameters(parent, D, alpha)
+  if init_log_factors is None:
+    log_factors = fit_base_parameters(parent, D, alpha)
+  else:
+    log_factors = init_log_factors
   base = ChowLiuTree(parent, D.r, log_factors)
-
+  
   if lambda_ == 0:
     return base
-  if np.isclose(base.penalty(C, epsilon), 0):
+  if np.isclose(base.penalty(D.C, D.epsilon), 0):
     # print (np.isclose(base.penalty(C, epsilon), 0))
     return base
 
   init = pack(log_factors, parent, D.r)
-  args = (parent, D.r, D.X, ss, alpha, C, epsilon, lambda_)
+  args = (parent, D.r, D.X, ss, alpha, D.C, D.epsilon, lambda_)
   # print (check_grad(f, g, init, *args))
   # print (g(init, *args))
   options = dict(maxfun=30000, maxiter=30000)
@@ -354,4 +568,111 @@ def fit_grad(D: Dataset, C: np.ndarray, epsilon: float, lambda_: float, alpha: f
   log_factors = [log_softmax(t) if p < 0 else log_softmax(t, axis=1)
                  for t, p in zip(theta, parent)]
 
-  return ChowLiuTree(parent, D.r, log_factors)
+  return log_factors
+
+
+class Node:
+  scope: List[int]
+  
+  def __init__(self):
+    self.scope = []
+    
+  def __repr__(self):
+    return f"<{self.__class__.__name__} scope={self.scope}>"
+
+
+class BaseLeaf(Node):
+  scope: List[int]
+  r: List[int]
+  clt: ChowLiuTree
+
+  def __init__(self):
+    super().__init__()
+    self.r = []
+  
+  @property
+  def parameter_count(self):
+    return sum([len(f)-1 if p < 0 else f.shape[0]*(f.shape[1]-1) for p, f in zip(self.clt.parent, self.clt.log_factors)])
+    
+  def fit(self, D: Dataset, alpha: float):
+    self.r = D.r
+    self.scope = D.scope
+    parent = fit_structure(D, alpha)
+    log_factors = fit_base_parameters(parent, D, alpha)
+    self.clt = ChowLiuTree(parent, D.r, log_factors)
+    return self
+
+  def loglik(self, D: Dataset):
+    assert D.scope == self.scope
+    assert D.r == self.r
+    
+    return self.clt.loglik(D.X)
+
+  def logmar(self, query: List[Tuple[int, int]]):
+    q = [(self.scope.index(i), vi) for (i, vi) in query]
+    return self.clt.logmar(q)
+
+  def logp(self, X: npt.NDArray):
+    assert X.shape[1] == len(self.scope)
+    
+    return self.clt.logp(X)
+
+  def penalty(self, C: npt.NDArray, epsilon: float) -> float:
+    assert C.shape[0] == C.shape[1]
+    assert C.shape[0] == len(self.scope)
+    
+    return self.clt.penalty(C, epsilon)
+  
+  def delta(self, i: int, j: int, sign: int, epsilon: float) -> float:
+    return self.clt.delta(self.scope.index(i), self.scope.index(j), sign, epsilon)
+
+class Leaf(BaseLeaf):
+  scope: List[int]
+  r: List[int]
+  clt: ChowLiuTree
+
+  def __init__(self, leaf = None):
+    super().__init__()
+    if leaf is not None:
+      self.scope = leaf.scope
+      self.r = leaf.r
+      self.clt = leaf.clt
+  
+  def fit(self, D: DatasetWithKnowledge, alpha: float, tries: int):
+    self.r = D.r
+    self.scope = D.scope
+    
+    if not hasattr(self, "clt"): 
+      parent = fit_structure(D, alpha)
+      log_factors = fit_base_parameters(parent, D, alpha)
+      clt = ChowLiuTree(parent, D.r, log_factors)
+    else:
+      clt = self.clt
+      parent = clt.parent
+      log_factors = clt.log_factors
+      
+    prev = clt.penalty(D.C, D.epsilon)
+    
+    for L in range(tries):
+      if np.isclose(prev, 0):
+        break
+      
+      # parent: list, D: Dataset, alpha: float, lambda_: float
+      clt.log_factors = fit_grad_parameters(parent, D, alpha, (10 ** L), clt.log_factors)
+
+      current = clt.penalty(D.C, D.epsilon)
+      if not (current < prev):
+        break
+      prev = current
+    
+    self.clt = clt
+    
+    return self
+
+def format_influences(C, names):
+  return [
+    f"{names[j]} ≺ᴹ⁺ {names[i]}"
+    if C[i, j] == +1
+    else f"{names[j]} ≺ᴹ⁻ {names[i]}"
+    for i, j in zip(*np.nonzero(C))
+  ]

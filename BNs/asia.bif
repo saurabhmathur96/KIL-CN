@@ -1,0 +1,61 @@
+network unknown {
+}
+variable asia {
+  type discrete [ 2 ] { 0, 1 };
+}
+variable tub {
+  type discrete [ 2 ] { 0, 1 };
+}
+variable smoke {
+  type discrete [ 2 ] { 0, 1 };
+}
+variable lung {
+  type discrete [ 2 ] { 0, 1 };
+}
+variable bronc {
+  type discrete [ 2 ] { 0, 1 };
+}
+variable either {
+  type discrete [ 2 ] { 0, 1 };
+}
+variable xray {
+  type discrete [ 2 ] { 0, 1 };
+}
+variable dysp {
+  type discrete [ 2 ] { 0, 1 };
+}
+probability ( asia ) {
+  table 0.01, 0.99;
+}
+probability ( tub | asia ) {
+  
+  (0) 0.99, 0.01;
+  (1) 0.95, 0.05;
+}
+probability ( smoke ) {
+  table 0.5, 0.5;
+}
+probability ( lung | smoke ) {
+  (0) 0.99, 0.01;
+  (1) 0.9, 0.1;
+}
+probability ( bronc | smoke ) {
+  (0) 0.7, 0.3;
+  (1) 0.4, 0.6;
+}
+probability ( either | lung, tub ) {
+  (1, 1) 0.0, 1.0;
+  (0, 1) 0.0, 1.0;
+  (1, 0) 0.0, 1.0;
+  (0, 0) 1.0, 0.0;
+}
+probability ( xray | either ) {
+  (1) 0.02, 0.98;
+  (0) 0.95, 0.05;
+}
+probability ( dysp | bronc, either ) {
+  (1, 1) 0.1, 0.9;
+  (0, 1)  0.3, 0.7;
+  (1, 0) 0.2, 0.8;
+  (0, 0) 0.9, 0.1;
+}
